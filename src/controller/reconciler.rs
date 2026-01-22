@@ -18,12 +18,13 @@ use kube::{
     },
     ResourceExt,
 };
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::crd::{NodeType, StellarNode, StellarNodeStatus};
 use crate::error::{Error, Result};
 
 use super::finalizers::STELLAR_NODE_FINALIZER;
+use super::health;
 use super::resources;
 
 /// Shared state for the controller
@@ -151,6 +152,33 @@ async fn apply_stellar_node(client: &Client, node: &StellarNode) -> Result<Actio
     resources::ensure_service(client, node).await?;
     info!("Service ensured for {}/{}", namespace, name);
 
+
+    // 5. Perform health check to determine if node is ready
+    let health_result = health::check_node_health(client, node).await?;
+    
+    debug!(
+        "Health check result for {}/{}: healthy={}, synced={}, message={}",
+        namespace, name, health_result.healthy, health_result.synced, health_result.message
+    );
+    
+    // Determine the phase based on health check
+    let (phase, message) = if node.spec.suspended {
+        ("Suspended", "Node is suspended".to_string())
+    } else if !health_result.healthy {
+        ("Creating", health_result.message.clone())
+    } else if !health_result.synced {
+        ("Syncing", health_result.message.clone())
+    } else {
+        ("Ready", "Node is healthy and synced".to_string())
+    };
+    
+    // 6. Update status with health check results
+    update_status_with_health(client, node, phase, Some(&message), &health_result).await?;
+    
+    info!(
+        "Node {}/{} status updated to: {} - {}",
+        namespace, name, phase, message
+    );
     // 5. Create/update Ingress if configured
     resources::ensure_ingress(client, node).await?;
     info!("Ingress ensured for {}/{}", namespace, name);
@@ -186,8 +214,17 @@ async fn apply_stellar_node(client: &Client, node: &StellarNode) -> Result<Actio
     )
     .await?;
 
-    // Requeue after 30 seconds to check node health and sync status
-    Ok(Action::requeue(Duration::from_secs(30)))
+
+    // Requeue based on current state
+    let requeue_duration = if phase == "Ready" {
+        // Check less frequently when ready
+        Duration::from_secs(60)
+    } else {
+        // Check more frequently when syncing
+        Duration::from_secs(15)
+    };
+    
+    Ok(Action::requeue(requeue_duration))
 }
 
 /// Clean up resources when the StellarNode is deleted
@@ -322,6 +359,77 @@ async fn update_status(
             node.spec.replicas
         },
         ready_replicas,
+        ..Default::default()
+    };
+
+    let patch = serde_json::json!({ "status": status });
+    api.patch_status(
+        &node.name_any(),
+        &PatchParams::apply("stellar-operator"),
+        &Patch::Merge(&patch),
+    )
+    .await
+    .map_err(Error::KubeError)?;
+
+    Ok(())
+}
+
+/// Update the status subresource with health check results
+async fn update_status_with_health(
+    client: &Client,
+    node: &StellarNode,
+    phase: &str,
+    message: Option<&str>,
+    health: &health::HealthCheckResult,
+) -> Result<()> {
+    let namespace = node.namespace().unwrap_or_else(|| "default".to_string());
+    let api: Api<StellarNode> = Api::namespaced(client.clone(), &namespace);
+
+    // Build conditions based on health check
+    let mut conditions = Vec::new();
+    
+    // Ready condition
+    let ready_condition = if health.synced {
+        crate::crd::Condition::ready(
+            true,
+            "NodeSynced",
+            "Node is fully synced and operational",
+        )
+    } else if health.healthy {
+        crate::crd::Condition::ready(
+            false,
+            "NodeSyncing",
+            &health.message,
+        )
+    } else {
+        crate::crd::Condition::ready(
+            false,
+            "NodeNotHealthy",
+            &health.message,
+        )
+    };
+    conditions.push(ready_condition);
+    
+    // Progressing condition
+    if !health.synced && health.healthy {
+        conditions.push(crate::crd::Condition::progressing(
+            "Syncing",
+            &health.message,
+        ));
+    }
+
+    let status = StellarNodeStatus {
+        phase: phase.to_string(),
+        message: message.map(String::from),
+        observed_generation: node.metadata.generation,
+        replicas: if node.spec.suspended { 0 } else { node.spec.replicas },
+        ready_replicas: if health.synced && !node.spec.suspended {
+            node.spec.replicas
+        } else {
+            0
+        },
+        ledger_sequence: health.ledger_sequence,
+        conditions,
         ..Default::default()
     };
 
