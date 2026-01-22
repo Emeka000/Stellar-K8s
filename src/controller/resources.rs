@@ -753,6 +753,87 @@ pub async fn ensure_hpa(client: &Client, node: &StellarNode) -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// Alerting (ConfigMap with Prometheus Rules)
+// ============================================================================
+
+/// Ensure alerting resources exist for the node if enabled
+pub async fn ensure_alerting(client: &Client, node: &StellarNode) -> Result<()> {
+    let namespace = node.namespace().unwrap_or_else(|| "default".to_string());
+    let name = resource_name(node, "alerts");
+
+    if !node.spec.alerting {
+        return delete_alerting(client, node).await;
+    }
+
+    let labels = standard_labels(node);
+    let mut data = BTreeMap::new();
+
+    // Define standard alerting rules in Prometheus format
+    let rules = format!(
+        r#"groups:
+- name: {instance}.rules
+  rules:
+  - alert: StellarNodeDown
+    expr: up{{app_kubernetes_io_instance="{instance}"}} == 0
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Stellar node {instance} is down"
+      description: "The Stellar node {instance} has been down for more than 5 minutes."
+  - alert: StellarNodeHighMemory
+    expr: container_memory_usage_bytes{{pod=~"{instance}.*"}} / container_spec_memory_limit_bytes > 0.8
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Stellar node {instance} high memory usage"
+      description: "The Stellar node {instance} is using more than 80% of its memory limit."
+  - alert: StellarNodeSyncIssue
+    expr: stellar_core_sync_status{{app_kubernetes_io_instance="{instance}"}} != 1
+    for: 15m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Stellar node {instance} sync issue"
+      description: "The Stellar node {instance} has not been in sync for more than 15 minutes."
+"#,
+        instance = node.name_any()
+    );
+
+    data.insert("alerts.yaml".to_string(), rules);
+
+    let cm = ConfigMap {
+        metadata: ObjectMeta {
+            name: Some(name.clone()),
+            namespace: Some(namespace.clone()),
+            labels: Some(labels),
+            owner_references: Some(vec![owner_reference(node)]),
+            ..Default::default()
+        },
+        data: Some(data),
+        ..Default::default()
+    };
+
+    let api: Api<ConfigMap> = Api::namespaced(client.clone(), &namespace);
+    let patch = Patch::Apply(&cm);
+    api.patch(
+        &name,
+        &PatchParams::apply("stellar-operator").force(),
+        &patch,
+    )
+    .await?;
+
+    info!(
+        "Alerting ConfigMap {} ensured for {}/{}",
+        name,
+        namespace,
+        node.name_any()
+    );
+    Ok(())
+}
+
 fn build_hpa(node: &StellarNode) -> Result<HorizontalPodAutoscaler> {
     let autoscaling = node
         .spec
@@ -874,6 +955,23 @@ pub async fn delete_service_monitor(_client: &Client, node: &StellarNode) -> Res
         "Note: ServiceMonitor {}/{} must be manually deleted if it was created",
         namespace, name
     );
+
+    Ok(())
+}
+
+/// Delete alerting resources
+pub async fn delete_alerting(client: &Client, node: &StellarNode) -> Result<()> {
+    let namespace = node.namespace().unwrap_or_else(|| "default".to_string());
+    let name = resource_name(node, "alerts");
+
+    let api: Api<ConfigMap> = Api::namespaced(client.clone(), &namespace);
+    match api.delete(&name, &DeleteParams::default()).await {
+        Ok(_) => info!("Deleted alerting ConfigMap {}", name),
+        Err(kube::Error::Api(e)) if e.code == 404 => {
+            // Already gone
+        }
+        Err(e) => return Err(Error::KubeError(e)),
+    }
 
     Ok(())
 }
