@@ -126,6 +126,10 @@ pub struct StellarNodeSpec {
     /// for peer-to-peer (Validators), API access (Horizon/Soroban), and metrics
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network_policy: Option<NetworkPolicyConfig>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "serde_json::Value")]
+    pub topology_spread_constraints: Option<Vec<k8s_openapi::api::core::v1::TopologySpreadConstraint>>,
 }
 
 fn default_replicas() -> i32 {
