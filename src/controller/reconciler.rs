@@ -1,6 +1,4 @@
-//! Main reconciler for StellarNode resources
-//!
-//! Implements the controller pattern using kube-rs runtime.
+
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +29,21 @@ const ARCHIVE_RETRIES_ANNOTATION: &str = "stellar.org/archive-retries";
 use super::finalizers::STELLAR_NODE_FINALIZER;
 use super::health;
 use super::mtls;
+use crate::crd::{
+    AutoscalingConfig, Condition, IngressConfig, NodeType, StellarNode, StellarNodeStatus,
+};
+use crate::error::{Error, Result};
+
+// Constants
+const ARCHIVE_RETRIES_ANNOTATION: &str = "stellar.org/archive-health-retries";
+
+use super::archive_health::{calculate_backoff, check_history_archive_health, ArchiveHealthResult};
+use super::finalizers::STELLAR_NODE_FINALIZER;
+use super::health;
+use super::metrics;
+use super::remediation;
 use super::resources;
+use super::vsl;
 
 /// Shared state for the controller
 pub struct ControllerState {
@@ -115,45 +127,6 @@ async fn emit_event(
     Ok(())
 }
 
-/// Get the current retry count for archive health checks from annotations
-fn get_retry_count(node: &StellarNode) -> u32 {
-    node.metadata
-        .annotations
-        .as_ref()
-        .and_then(|a| a.get(ARCHIVE_RETRIES_ANNOTATION))
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
-}
-
-/// Set the retry count for archive health checks in annotations
-async fn set_retry_count(client: &Client, node: &StellarNode, count: u32) -> Result<()> {
-    let namespace = node.namespace().unwrap_or_else(|| "default".to_string());
-    let api: Api<StellarNode> = Api::namespaced(client.clone(), &namespace);
-
-    let mut annotations = node.metadata.annotations.clone().unwrap_or_default();
-    if count == 0 {
-        annotations.remove(ARCHIVE_RETRIES_ANNOTATION);
-    } else {
-        annotations.insert(ARCHIVE_RETRIES_ANNOTATION.to_string(), count.to_string());
-    }
-
-    let patch = serde_json::json!({
-        "metadata": {
-            "annotations": annotations
-        }
-    });
-
-    api.patch(
-        &node.name_any(),
-        &PatchParams::apply("stellar-operator"),
-        &Patch::Merge(&patch),
-    )
-    .await
-    .map_err(Error::KubeError)?;
-
-    Ok(())
-}
-
 /// The main reconciliation function
 ///
 /// This function is called whenever:
@@ -199,22 +172,28 @@ async fn apply_stellar_node(
     // Validate the spec
     if let Err(e) = node.spec.validate() {
         warn!("Validation failed for {}/{}: {}", namespace, name, e);
-        update_status(client, node, "Failed", Some(&e), 0, true).await?;
+        update_status(client, node, "Failed", Some(e.as_str()), 0, true).await?;
         return Err(Error::ValidationError(e));
     }
 
     // 1. Core infrastructure (PVC and ConfigMap) always managed by operator
     resources::ensure_pvc(client, node).await?;
     resources::ensure_config_map(client, node, ctx.enable_mtls).await?;
+    // 2. Handle suspension
+    if node.spec.suspended {
+        info!("Node {}/{} is suspended, scaling to 0", namespace, name);
 
-    // 2. Maintenance Mode Check
-    // If active, we skip workload management (Step 3) and suspension checks.
-    // This allows a human to manually scale the node up or down as needed.
-    if node.spec.maintenance_mode {
-        info!(
-            "Node {}/{} in Maintenance Mode. Skipping workload updates.",
-            namespace, name
-        );
+        resources::ensure_pvc(client, node).await?;
+        resources::ensure_config_map(client, node, None).await?;
+        
+        match node.spec.node_type {
+            NodeType::Validator => {
+                resources::ensure_statefulset(client, node).await?;
+            }
+            NodeType::Horizon | NodeType::SorobanRpc => {
+                resources::ensure_deployment(client, node).await?;
+            }
+        }
 
         resources::ensure_service(client, node, ctx.enable_mtls).await?;
 
@@ -227,6 +206,7 @@ async fn apply_stellar_node(
             true,
         )
         .await?;
+        update_suspended_status(client, node).await?;
 
         return Ok(Action::requeue(Duration::from_secs(60)));
     }
@@ -291,23 +271,19 @@ async fn apply_stellar_node(
                         )
                         .await?;
 
-                        // Update status with condition (observed_generation NOT updated to trigger retry)
+                        // Update status with archive health condition (observed_generation NOT updated to trigger retry)
                         update_archive_health_status(client, node, &health_result).await?;
 
-                        // Requeue with exponential backoff
-                        let retries = get_retry_count(node);
-                        let delay = calculate_backoff(retries, None, None);
-
+                        let delay = calculate_backoff(0, None, None);
                         info!(
                             "Requeuing {}/{} in {:?} (retry attempt {})",
                             namespace,
                             name,
                             delay,
                             retries + 1
+                            "Archive health check failed for {}/{}, requeuing in {:?}",
+                            namespace, name, delay
                         );
-
-                        // Increment retry count in annotations
-                        set_retry_count(client, node, retries + 1).await?;
 
                         return Ok(Action::requeue(delay));
                     } else {
@@ -317,13 +293,7 @@ async fn apply_stellar_node(
                             name,
                             health_result.summary()
                         );
-                        // Update status with archive health condition
                         update_archive_health_status(client, node, &health_result).await?;
-
-                        // Reset retry count on success
-                        if get_retry_count(node) > 0 {
-                            set_retry_count(client, node, 0).await?;
-                        }
                     }
                 }
             }
@@ -347,6 +317,33 @@ async fn apply_stellar_node(
 
     // 2. Create/update the ConfigMap for node configuration
     resources::ensure_config_map(client, node, ctx.enable_mtls).await?;
+    // 2. Handle VSL Fetching for Validators
+    let mut quorum_override = None;
+    if node.spec.node_type == NodeType::Validator {
+        if let Some(config) = &node.spec.validator_config {
+            if let Some(vl_source) = &config.vl_source {
+                match vsl::fetch_vsl(vl_source).await {
+                    Ok(quorum) => {
+                        quorum_override = Some(quorum);
+                    }
+                    Err(e) => {
+                        warn!("Failed to fetch VSL for {}/{}: {}", namespace, name, e);
+                        emit_event(
+                            client,
+                            node,
+                            "Warning",
+                            "VSLFetchFailed",
+                            &format!("Failed to fetch VSL from {}: {}", vl_source, e),
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Create/update the ConfigMap for node configuration
+    resources::ensure_config_map(client, node, quorum_override.clone()).await?;
     info!("ConfigMap ensured for {}/{}", namespace, name);
 
     // 2.5 Ensure mTLS certificates (if strict mTLS will be handled at rest_api level)
@@ -370,14 +367,153 @@ async fn apply_stellar_node(
 
     // 5. Perform health check to determine if node is ready
     let health_result = health::check_node_health(client, node, ctx.mtls_config.as_ref()).await?;
+    resources::ensure_service(client, node).await?;
+
+    // 5. Perform health check to determine if node is ready
+    let health_result = health::check_node_health(client, node).await?;
 
     debug!(
         "Health check result for {}/{}: healthy={}, synced={}, message={}",
         namespace, name, health_result.healthy, health_result.synced, health_result.message
     );
 
+    // 7. Trigger config-reload if VSL was updated and pod is ready
+    if let Some(_quorum) = quorum_override {
+        if health_result.healthy {
+            // Get pod IP to trigger reload
+            let pod_api: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(client.clone(), &namespace);
+            let lp = kube::api::ListParams::default().labels(&format!("app.kubernetes.io/instance={}", name));
+            if let Ok(pods) = pod_api.list(&lp).await {
+                if let Some(pod) = pods.items.first() {
+                    if let Some(status) = &pod.status {
+                        if let Some(ip) = &status.pod_ip {
+                            if let Err(e) = vsl::trigger_config_reload(ip).await {
+                                warn!("Failed to trigger config-reload for {}/{}: {}", namespace, name, e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 6. Auto-remediation check for stale nodes
+    // Only check if node is healthy but potentially stale (ledger not progressing)
+    if health_result.healthy && !node.spec.suspended {
+        let stale_check = remediation::check_stale_node(node, health_result.ledger_sequence);
+
+        if stale_check.is_stale {
+            warn!(
+                "Node {}/{} is stale: ledger stuck at {:?} for {:?} minutes",
+                namespace, name, stale_check.current_ledger, stale_check.minutes_since_progress
+            );
+
+            if remediation::can_remediate(node) {
+                match stale_check.recommended_action {
+                    remediation::RemediationLevel::Restart => {
+                        info!(
+                            "Initiating pod restart remediation for {}/{}",
+                            namespace, name
+                        );
+
+                        // Emit event before remediation
+                        remediation::emit_remediation_event(
+                            client,
+                            node,
+                            remediation::RemediationLevel::Restart,
+                            &format!(
+                                "Ledger stuck at {} for {} minutes",
+                                stale_check.current_ledger.unwrap_or(0),
+                                stale_check.minutes_since_progress.unwrap_or(0)
+                            ),
+                        )
+                        .await?;
+
+                        // Perform restart
+                        remediation::restart_pod(client, node).await?;
+
+                        // Update remediation state
+                        remediation::update_remediation_state(
+                            client,
+                            node,
+                            stale_check.current_ledger,
+                            remediation::RemediationLevel::Restart,
+                            true,
+                        )
+                        .await?;
+
+                        // Update status
+                        update_status(
+                            client,
+                            node,
+                            "Remediating",
+                            Some("Pod restarted due to stale ledger"),
+                            0,
+                            false,
+                        )
+                        .await?;
+
+                        return Ok(Action::requeue(Duration::from_secs(30)));
+                    }
+                    remediation::RemediationLevel::ClearAndResync => {
+                        // This requires manual intervention - just emit event
+                        warn!(
+                            "Node {}/{} requires manual intervention: restart didn't help",
+                            namespace, name
+                        );
+
+                        remediation::emit_remediation_event(
+                            client,
+                            node,
+                            remediation::RemediationLevel::ClearAndResync,
+                            "Restart didn't resolve stale state. Manual database clear may be required.",
+                        )
+                        .await?;
+
+                        remediation::update_remediation_state(
+                            client,
+                            node,
+                            stale_check.current_ledger,
+                            remediation::RemediationLevel::ClearAndResync,
+                            true,
+                        )
+                        .await?;
+
+                        update_status(
+                            client,
+                            node,
+                            "Degraded",
+                            Some("Node stale after restart. Manual intervention required."),
+                            0,
+                            false,
+                        )
+                        .await?;
+
+                        return Ok(Action::requeue(Duration::from_secs(60)));
+                    }
+                    remediation::RemediationLevel::None => {}
+                }
+            } else {
+                debug!(
+                    "Remediation cooldown active for {}/{}, skipping",
+                    namespace, name
+                );
+            }
+        } else {
+            // Node is healthy - update ledger tracking
+            remediation::update_remediation_state(
+                client,
+                node,
+                health_result.ledger_sequence,
+                remediation::RemediationLevel::None,
+                false,
+            )
+            .await?;
+        }
+    }
+
     // Determine the phase based on health check
-    let (phase, message) = if node.spec.suspended {
+    let (phase, message) = if false {
         ("Suspended", "Node is suspended".to_string())
     } else if !health_result.healthy {
         ("Creating", health_result.message.clone())
@@ -388,6 +524,8 @@ async fn apply_stellar_node(
     };
 
     // 6. Update status with health check results
+
+    // 7. Update status with health check results
     update_status_with_health(client, node, phase, Some(&message), &health_result).await?;
 
     info!(
@@ -411,10 +549,42 @@ async fn apply_stellar_node(
     // 7. Create/update alerting rules
     resources::ensure_alerting(client, node).await?;
     info!("Alerting ensured for {}/{}", namespace, name);
-    // 8. Fetch the ready replicas from Deployment/StatefulSet status
+
+    // 8. Create/update NetworkPolicy if configured
+    resources::ensure_network_policy(client, node).await?;
+
+    // 9. Fetch the ready replicas from Deployment/StatefulSet status
     let ready_replicas = get_ready_replicas(client, node).await.unwrap_or(0);
 
     // 9. Update status to Running with ready replica count
+    // 9. Update ledger sequence metric if available
+    if let Some(ref status) = node.status {
+        if let Some(seq) = status.ledger_sequence {
+            metrics::set_ledger_sequence(
+                &namespace,
+                &name,
+                &node.spec.node_type.to_string(),
+                node.spec.network.passphrase(),
+                seq,
+            );
+
+            // Calculate ingestion lag if we can get the latest network ledger
+            // For now we assume we have a way to track the "latest" known ledger across the cluster
+            // or fetch it from a public horizon.
+            if let Some(network_latest) = get_latest_network_ledger(&node.spec.network).await.ok() {
+                let lag = (network_latest as i64) - (seq as i64);
+                metrics::set_ingestion_lag(
+                    &namespace,
+                    &name,
+                    &node.spec.node_type.to_string(),
+                    node.spec.network.passphrase(),
+                    lag.max(0),
+                );
+            }
+        }
+    }
+
+    // 10. Update status to Running with ready replica count
     let phase = if node.spec.suspended {
         "Suspended"
     } else {
@@ -470,6 +640,11 @@ async fn cleanup_stellar_node(client: &Client, node: &StellarNode) -> Result<Act
     // 3. Delete Ingress
     if let Err(e) = resources::delete_ingress(client, node).await {
         warn!("Failed to delete Ingress: {:?}", e);
+    }
+
+    // 3a. Delete NetworkPolicy
+    if let Err(e) = resources::delete_network_policy(client, node).await {
+        warn!("Failed to delete NetworkPolicy: {:?}", e);
     }
 
     // 4. Delete Service
@@ -552,6 +727,44 @@ async fn get_ready_replicas(client: &Client, node: &StellarNode) -> Result<i32> 
             }
         }
     }
+}
+
+/// Update status for suspended nodes
+async fn update_suspended_status(client: &Client, node: &StellarNode) -> Result<()> {
+    let namespace = node.namespace().unwrap_or_else(|| "default".to_string());
+    let api: Api<StellarNode> = Api::namespaced(client.clone(), &namespace);
+
+    let condition = Condition {
+        type_: "Ready".to_string(),
+        status: "False".to_string(),
+        last_transition_time: chrono::Utc::now().to_rfc3339(),
+        reason: "NodeSuspended".to_string(),
+        message:
+            "Node is offline - replicas scaled to 0. Service remains active for peer discovery."
+                .to_string(),
+    };
+
+    let status = StellarNodeStatus {
+        phase: "Suspended".to_string(),
+        message: Some("Node suspended - scaled to 0 replicas".to_string()),
+        observed_generation: node.metadata.generation,
+        replicas: 0,
+        ready_replicas: 0,
+        ledger_sequence: None,
+        conditions: vec![condition],
+        ..Default::default()
+    };
+
+    let patch = serde_json::json!({ "status": status });
+    api.patch_status(
+        &node.name_any(),
+        &PatchParams::apply("stellar-operator"),
+        &Patch::Merge(&patch),
+    )
+    .await
+    .map_err(Error::KubeError)?;
+
+    Ok(())
 }
 
 /// Update the status subresource of a StellarNode
@@ -719,6 +932,23 @@ async fn update_status_with_health(
     .map_err(Error::KubeError)?;
 
     Ok(())
+}
+
+/// Helper to get the latest ledger from the Stellar network
+async fn get_latest_network_ledger(network: &crate::crd::StellarNetwork) -> Result<u64> {
+    let url = match network {
+        crate::crd::StellarNetwork::Mainnet => "https://horizon.stellar.org",
+        crate::crd::StellarNetwork::Testnet => "https://horizon-testnet.stellar.org",
+        crate::crd::StellarNetwork::Futurenet => "https://horizon-futurenet.stellar.org",
+        crate::crd::StellarNetwork::Custom(_) => return Err(Error::ConfigError("Custom network not supported for lag calculation yet".to_string())),
+    };
+
+    let client = reqwest::Client::new();
+    let resp = client.get(url).send().await.map_err(Error::HttpError)?;
+    let json: serde_json::Value = resp.json().await.map_err(|e| Error::ConfigError(e.to_string()))?;
+    
+    let ledger = json["history_latest_ledger"].as_u64().ok_or_else(|| Error::ConfigError("Failed to get latest ledger from horizon".to_string()))?;
+    Ok(ledger)
 }
 
 /// Error policy determines how to handle reconciliation errors

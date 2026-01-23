@@ -109,6 +109,20 @@ async fn main() -> Result<(), Error> {
     } else {
         None
     };
+    // Leader election configuration
+    let _namespace = std::env::var("POD_NAMESPACE").unwrap_or_else(|_| "default".to_string());
+    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| {
+        hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_else(|| "unknown-host".to_string())
+    });
+
+    info!("Leader election using holder ID: {}", hostname);
+
+    // TODO: Re-enable leader election once kube-leader-election version is aligned
+    // let lease_name = "stellar-operator-leader";
+    // let lock = LeaseLock::new(...);
 
     // Create shared controller state
     let state = Arc::new(controller::ControllerState {
@@ -119,6 +133,7 @@ async fn main() -> Result<(), Error> {
     });
 
     // Start the REST API server
+    // Start the REST API server (always running if feature enabled)
     #[cfg(feature = "rest-api")]
     {
         let api_state = state.clone();
