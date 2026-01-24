@@ -51,6 +51,7 @@ use super::resources;
 use super::vsl;
 
 // Constants
+#[allow(dead_code)]
 const ARCHIVE_RETRIES_ANNOTATION: &str = "stellar.org/archive-health-retries";
 
 /// Shared state for the controller
@@ -435,10 +436,6 @@ async fn apply_stellar_node(
 
     // 5. Perform health check to determine if node is ready
     let health_result = health::check_node_health(client, node, ctx.mtls_config.as_ref()).await?;
-    resources::ensure_service(client, node, ctx.enable_mtls).await?;
-
-    // 5. Perform health check to determine if node is ready
-    let health_result = health::check_node_health(client, node, ctx.mtls_config.as_ref()).await?;
 
     debug!(
         "Health check result for {}/{}: healthy={}, synced={}, message={}",
@@ -644,7 +641,7 @@ async fn apply_stellar_node(
             // Calculate ingestion lag if we can get the latest network ledger
             // For now we assume we have a way to track the "latest" known ledger across the cluster
             // or fetch it from a public horizon.
-            if let Some(network_latest) = get_latest_network_ledger(&node.spec.network).await.ok() {
+            if let Ok(network_latest) = get_latest_network_ledger(&node.spec.network).await {
                 let lag = (network_latest as i64) - (seq as i64);
                 metrics::set_ingestion_lag(
                     &namespace,
@@ -832,6 +829,7 @@ async fn update_suspended_status(client: &Client, node: &StellarNode) -> Result<
     }
 
     let status = StellarNodeStatus {
+        #[allow(deprecated)]
         phase: "Suspended".to_string(),
         message: Some("Node suspended - scaled to 0 replicas".to_string()),
         observed_generation: node.metadata.generation,
@@ -1222,6 +1220,7 @@ async fn update_status_with_health(
     }
 
     let status = StellarNodeStatus {
+        #[allow(deprecated)]
         phase: phase.to_string(),
         message: message.map(String::from),
         observed_generation: node.metadata.generation,

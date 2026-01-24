@@ -58,6 +58,7 @@ mod stellar_node_spec_validation {
                 stellar_core_url: "http://stellar-core:11626".to_string(),
                 ingest_workers: 1,
                 enable_experimental_ingestion: false,
+                auto_migration: false,
             }),
             soroban_config: None,
             replicas: 2,

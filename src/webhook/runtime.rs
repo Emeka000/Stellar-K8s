@@ -270,7 +270,7 @@ impl WasmRuntime {
         limits: &PluginLimits,
     ) -> Result<ExecutionResult> {
         // Create store with limits
-        let store_limits = StoreLimitsBuilder::new()
+        let _store_limits = StoreLimitsBuilder::new()
             .memory_size(limits.max_memory_bytes as usize)
             .build();
 

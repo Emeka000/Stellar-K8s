@@ -511,8 +511,9 @@ fn build_service(node: &StellarNode, enable_mtls: bool) -> Service {
 // ============================================================================
 
 /// Ensure a LoadBalancer Service exists for external access via MetalLB
-#[instrument(skip(client, node), fields(name = %node.name_any(), namespace = node.namespace()))]
-pub async fn ensure_load_balancer_service(client: &Client, node: &StellarNode) -> Result<()> {
+#[instrument(skip(_client, node), fields(name = %node.name_any(), namespace = node.namespace()))]
+#[allow(dead_code)]
+pub async fn ensure_load_balancer_service(_client: &Client, node: &StellarNode) -> Result<()> {
     // TODO: load_balancer field not yet implemented in StellarNodeSpec
     // Uncomment when LoadBalancerConfig is added to the spec
     /*
@@ -703,9 +704,9 @@ fn build_load_balancer_service(node: &StellarNode, config: &LoadBalancerConfig) 
 }
 
 /// Delete the LoadBalancer Service for a node
-#[instrument(skip(client, node), fields(name = %node.name_any(), namespace = node.namespace()))]
+#[instrument(skip(_client, node), fields(name = %node.name_any(), namespace = node.namespace()))]
 #[allow(dead_code)]
-pub async fn delete_load_balancer_service(client: &Client, node: &StellarNode) -> Result<()> {
+pub async fn delete_load_balancer_service(_client: &Client, node: &StellarNode) -> Result<()> {
     // TODO: load_balancer field not yet implemented in StellarNodeSpec
     #[allow(unreachable_code)]
     {
@@ -739,9 +740,9 @@ pub async fn delete_load_balancer_service(client: &Client, node: &StellarNode) -
 /// Ensure MetalLB BGPAdvertisement and IPAddressPool ConfigMaps are documented
 /// Note: MetalLB CRDs must be created manually or via Helm; this function
 /// creates the recommended ConfigMap for cluster operators to reference.
-#[instrument(skip(client, node), fields(name = %node.name_any(), namespace = node.namespace()))]
+#[instrument(skip(_client, node), fields(name = %node.name_any(), namespace = node.namespace()))]
 #[allow(dead_code)]
-pub async fn ensure_metallb_config(client: &Client, node: &StellarNode) -> Result<()> {
+pub async fn ensure_metallb_config(_client: &Client, node: &StellarNode) -> Result<()> {
     // TODO: load_balancer field not yet implemented in StellarNodeSpec
     #[allow(unreachable_code)]
     {
@@ -1354,7 +1355,6 @@ fn build_container(node: &StellarNode, enable_mtls: bool) -> Container {
                             }),
                             ..Default::default()
                         }),
-                        ..Default::default()
                     });
                 }
                 KeySource::KMS => {
@@ -1378,7 +1378,7 @@ fn build_container(node: &StellarNode, enable_mtls: bool) -> Container {
                 secret_key_ref: Some(SecretKeySelector {
                     name: Some(db_config.secret_key_ref.name.clone()),
                     key: db_config.secret_key_ref.key.clone(),
-                    optional: None,
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),

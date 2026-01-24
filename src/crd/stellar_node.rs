@@ -378,7 +378,6 @@ fn validate_ingress(ingress: &IngressConfig) -> Result<(), String> {
 }
 
 #[allow(dead_code)]
-#[allow(dead_code)]
 fn validate_load_balancer(lb: &LoadBalancerConfig) -> Result<(), String> {
     use super::types::LoadBalancerMode;
 
@@ -426,7 +425,6 @@ fn validate_load_balancer(lb: &LoadBalancerConfig) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(dead_code)]
 #[allow(dead_code)]
 fn validate_global_discovery(gd: &GlobalDiscoveryConfig) -> Result<(), String> {
     if !gd.enabled {
@@ -556,11 +554,10 @@ impl StellarNodeStatus {
     /// assert_eq!(status.phase, "Creating");
     /// assert_eq!(status.message, None);
     /// ```
-
     /// DEPRECATED: Use `with_conditions` instead
     #[deprecated(since = "0.2.0", note = "Use with_conditions instead")]
-
     pub fn with_phase(phase: &str) -> Self {
+        #[allow(deprecated)]
         Self {
             phase: phase.to_string(),
             ..Default::default()
@@ -587,15 +584,14 @@ impl StellarNodeStatus {
     /// assert_eq!(status.phase, "Ready");
     /// assert_eq!(status.message, Some("Node is fully synced".to_string()));
     /// ```
-
     /// DEPRECATED: Use condition helpers instead
+    #[allow(deprecated)]
     #[deprecated(since = "0.2.0", note = "Use set_condition helpers instead")]
-
     pub fn update(&mut self, phase: &str, message: Option<&str>) {
         self.phase = phase.to_string();
         self.message = message.map(String::from);
     }
-
+    #[allow(clippy::empty_line_after_doc_comments)]
     /// Check if the node is ready
     ///
     /// Returns true only if both:
@@ -619,13 +615,11 @@ impl StellarNodeStatus {
     /// status.ready_replicas = 0;
     /// assert!(!status.is_ready());
     /// ```
-
     /// Check if the node is ready based on conditions
     ///
     /// A node is considered ready when:
     /// - Ready condition is True
     /// - ready_replicas >= replicas (all replicas are ready)
-
     pub fn is_ready(&self) -> bool {
         let has_ready_condition = self
             .conditions
