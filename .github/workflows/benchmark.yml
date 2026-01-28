@@ -2,7 +2,7 @@ name: Performance Benchmark
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, stellar-k8]
     tags: ['v*']
   pull_request:
     branches: [main]
