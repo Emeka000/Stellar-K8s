@@ -216,32 +216,34 @@ impl CNPGManager {
                     recovery: None,
                 }),
                 backup: if db_config.backup.enabled {
-                    Some(BackupConfiguration {
-                        barman_object_store: BarmanObjectStore {
-                            destination_path: format!(
-                                "s3://{}/{}",
-                                db_config.backup.s3.as_ref().unwrap().bucket,
-                                name
-                            ),
-                            endpoint_url: db_config.backup.s3.as_ref().unwrap().endpoint_url.clone(),
-                            s3_credentials: S3Credentials {
-                                access_key_id: SecretKeySelector {
-                                    name: db_config.backup.s3.as_ref().unwrap()
-                                        .credentials.secret_name.clone(),
+                    if let Some(s3) = db_config.backup.s3.as_ref() {
+                        Some(BackupConfiguration {
+                            barman_object_store: BarmanObjectStore {
+                                destination_path: format!(
+                                    "s3://{}/{}",
+                                    s3.bucket,
+                                    name
+                                ),
+                                endpoint_url: s3.endpoint_url.clone(),
+                                s3_credentials: S3Credentials {
+                                    access_key_id: SecretKeySelector {
+                                        name: s3.credentials.secret_name.clone(),
+                                    },
+                                    secret_access_key: SecretKeySelector {
+                                        name: s3.credentials.secret_name.clone(),
+                                    },
+                                    region: Some(s3.region.clone()),
                                 },
-                                secret_access_key: SecretKeySelector {
-                                    name: db_config.backup.s3.as_ref().unwrap()
-                                        .credentials.secret_name.clone(),
+                                wal: WalConfiguration {
+                                    compression: "gzip".to_string(),
+                                    encryption: "AES256".to_string(),
                                 },
-                                region: Some(db_config.backup.s3.as_ref().unwrap().region.clone()),
                             },
-                            wal: WalConfiguration {
-                                compression: "gzip".to_string(),
-                                encryption: "AES256".to_string(),
-                            },
-                        },
-                        retention_policy: db_config.backup.retention_policy.clone(),
-                    })
+                            retention_policy: db_config.backup.retention_policy.clone(),
+                        })
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 },
