@@ -304,8 +304,8 @@ impl CNPGManager {
                     pool_mode: pooler_config.pool_mode.clone(),
                     parameters: std::collections::HashMap::from([
                         ("max_client_conn".to_string(), pooler_config.max_client_conn.to_string()),
-                        ("default_pool_size".to_string(), "25".to_string()),
-                        ("reserve_pool_size".to_string(), "5".to_string()),
+                        ("default_pool_size".to_string(), pooler_config.default_pool_size.to_string()),
+                        ("reserve_pool_size".to_string(), pooler_config.reserve_pool_size.to_string()),
                     ]),
                 },
             },
