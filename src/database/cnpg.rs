@@ -246,20 +246,70 @@ impl CNPGManager {
                     None
                 },
                 postgresql: PostgreSQLConfiguration {
-                    parameters: std::collections::HashMap::from([
-                        ("max_connections".to_string(), "200".to_string()),
-                        ("shared_buffers".to_string(), "256MB".to_string()),
-                        ("effective_cache_size".to_string(), "1GB".to_string()),
-                        ("maintenance_work_mem".to_string(), "64MB".to_string()),
-                        ("checkpoint_completion_target".to_string(), "0.9".to_string()),
-                        ("wal_buffers".to_string(), "16MB".to_string()),
-                        ("default_statistics_target".to_string(), "100".to_string()),
-                        ("random_page_cost".to_string(), "1.1".to_string()),
-                        ("effective_io_concurrency".to_string(), "200".to_string()),
-                        ("work_mem".to_string(), "4MB".to_string()),
-                        ("min_wal_size".to_string(), "1GB".to_string()),
-                        ("max_wal_size".to_string(), "4GB".to_string()),
-                    ]),
+                    parameters: {
+                        let mut params = std::collections::HashMap::new();
+                        params.insert(
+                            "max_connections".to_string(),
+                            std::env::var("CNPG_MAX_CONNECTIONS")
+                                .unwrap_or_else(|_| "200".to_string()),
+                        );
+                        params.insert(
+                            "shared_buffers".to_string(),
+                            std::env::var("CNPG_SHARED_BUFFERS")
+                                .unwrap_or_else(|_| "256MB".to_string()),
+                        );
+                        params.insert(
+                            "effective_cache_size".to_string(),
+                            std::env::var("CNPG_EFFECTIVE_CACHE_SIZE")
+                                .unwrap_or_else(|_| "1GB".to_string()),
+                        );
+                        params.insert(
+                            "maintenance_work_mem".to_string(),
+                            std::env::var("CNPG_MAINTENANCE_WORK_MEM")
+                                .unwrap_or_else(|_| "64MB".to_string()),
+                        );
+                        params.insert(
+                            "checkpoint_completion_target".to_string(),
+                            std::env::var("CNPG_CHECKPOINT_COMPLETION_TARGET")
+                                .unwrap_or_else(|_| "0.9".to_string()),
+                        );
+                        params.insert(
+                            "wal_buffers".to_string(),
+                            std::env::var("CNPG_WAL_BUFFERS")
+                                .unwrap_or_else(|_| "16MB".to_string()),
+                        );
+                        params.insert(
+                            "default_statistics_target".to_string(),
+                            std::env::var("CNPG_DEFAULT_STATISTICS_TARGET")
+                                .unwrap_or_else(|_| "100".to_string()),
+                        );
+                        params.insert(
+                            "random_page_cost".to_string(),
+                            std::env::var("CNPG_RANDOM_PAGE_COST")
+                                .unwrap_or_else(|_| "1.1".to_string()),
+                        );
+                        params.insert(
+                            "effective_io_concurrency".to_string(),
+                            std::env::var("CNPG_EFFECTIVE_IO_CONCURRENCY")
+                                .unwrap_or_else(|_| "200".to_string()),
+                        );
+                        params.insert(
+                            "work_mem".to_string(),
+                            std::env::var("CNPG_WORK_MEM")
+                                .unwrap_or_else(|_| "4MB".to_string()),
+                        );
+                        params.insert(
+                            "min_wal_size".to_string(),
+                            std::env::var("CNPG_MIN_WAL_SIZE")
+                                .unwrap_or_else(|_| "1GB".to_string()),
+                        );
+                        params.insert(
+                            "max_wal_size".to_string(),
+                            std::env::var("CNPG_MAX_WAL_SIZE")
+                                .unwrap_or_else(|_| "4GB".to_string()),
+                        );
+                        params
+                    },
                 },
                 monitoring: Some(MonitoringConfiguration {
                     enable_pod_monitor: true,
